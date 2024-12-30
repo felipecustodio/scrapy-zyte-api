@@ -1,9 +1,10 @@
 from base64 import b64decode
+from copy import copy
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 from scrapy import Request
-from scrapy.http import HtmlResponse, Response, TextResponse
+from scrapy.http import Headers, HtmlResponse, Response, TextResponse
 from scrapy.http.cookies import CookieJar
 from scrapy.responsetypes import responsetypes
 
@@ -22,7 +23,7 @@ class ZyteAPIMixin:
         # Zyte API already decompresses the HTTP Response Body. Scrapy's
         # HttpCompressionMiddleware will error out when it attempts to
         # decompress an already decompressed body based on this header.
-        "content-encoding"
+        "content-encoding",
     }
 
     def __init__(self, *args, raw_api_response: Optional[Dict] = None, **kwargs):
@@ -56,8 +57,7 @@ class ZyteAPIMixin:
     def raw_api_response(self) -> Optional[Dict]:
         """Contains the raw API response from Zyte API.
 
-        To see the full list of parameters and their description, kindly refer to the
-        `Zyte API Specification <https://docs.zyte.com/zyte-api/openapi.html#zyte-openapi-spec>`_.
+        For the full list of parameters, see :ref:`zapi-reference`.
         """
         return self._raw_api_response
 
@@ -90,18 +90,21 @@ class ZyteAPIMixin:
         input_headers: Optional[List[Dict[str, str]]] = api_response.get(
             "httpResponseHeaders"
         )
+        response_cookies: Optional[List[Dict[str, str]]] = api_response.get(
+            "experimental", {}
+        ).get("responseCookies")
         if input_headers:
+            headers_to_remove = copy(cls.REMOVE_HEADERS)
+            if response_cookies:
+                headers_to_remove.add("set-cookie")
             result = {
                 h["name"]: [h["value"]]
                 for h in input_headers
-                if h["name"].lower() not in cls.REMOVE_HEADERS
+                if h["name"].lower() not in headers_to_remove
             }
-        input_cookies: Optional[List[Dict[str, str]]] = api_response.get(
-            "experimental", {}
-        ).get("responseCookies")
-        if input_cookies:
+        if response_cookies:
             result["Set-Cookie"] = []
-            for cookie in input_cookies:
+            for cookie in response_cookies:
                 result["Set-Cookie"].append(
                     cls._response_cookie_to_header_value(cookie)
                 )
@@ -110,7 +113,9 @@ class ZyteAPIMixin:
 
 class ZyteAPITextResponse(ZyteAPIMixin, HtmlResponse):
     @classmethod
-    def from_api_response(cls, api_response: Dict, *, request: Request = None):
+    def from_api_response(
+        cls, api_response: Dict, *, request: Optional[Request] = None
+    ):
         """Alternative constructor to instantiate the response from the raw
         Zyte API response.
         """
@@ -141,7 +146,9 @@ class ZyteAPITextResponse(ZyteAPIMixin, HtmlResponse):
 
 class ZyteAPIResponse(ZyteAPIMixin, Response):
     @classmethod
-    def from_api_response(cls, api_response: Dict, *, request: Request = None):
+    def from_api_response(
+        cls, api_response: Dict, *, request: Optional[Request] = None
+    ):
         """Alternative constructor to instantiate the response from the raw
         Zyte API response.
         """
@@ -187,9 +194,13 @@ def _process_response(
         return ZyteAPITextResponse.from_api_response(api_response, request=request)
 
     if api_response.get("httpResponseHeaders") and api_response.get("httpResponseBody"):
+        # a plain dict here doesn't work correctly on Scrapy < 2.1
+        scrapy_headers = Headers()
+        for header in cast(List[Dict[str, str]], api_response["httpResponseHeaders"]):
+            scrapy_headers[header["name"].encode()] = header["value"].encode()
         response_cls = responsetypes.from_args(
-            headers=api_response["httpResponseHeaders"],
-            url=api_response["url"],
+            headers=scrapy_headers,
+            url=cast(str, api_response["url"]),
             # FIXME: update this when python-zyte-api supports base64 decoding
             body=b64decode(api_response["httpResponseBody"]),  # type: ignore
         )

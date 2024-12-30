@@ -7,7 +7,8 @@ from base64 import b64encode
 from contextlib import asynccontextmanager
 from importlib import import_module
 from subprocess import PIPE, Popen
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 from pytest_twisted import ensureDeferred
 from scrapy import Request
@@ -17,9 +18,20 @@ from twisted.internet.task import deferLater
 from twisted.web.resource import Resource
 from twisted.web.server import NOT_DONE_YET, Site
 
+from scrapy_zyte_api._annotations import _ActionResult
 from scrapy_zyte_api.responses import _API_RESPONSE
 
 from . import SETTINGS, make_handler
+
+
+# https://github.com/scrapy/scrapy/blob/02b97f98e74a994ad3e4d74e7ed55207e508a576/tests/mockserver.py#L27C1-L33C19
+def getarg(request, name, default=None, type=None):
+    if name in request.args:
+        value = request.args[name][0]
+        if type is not None:
+            value = type(value)
+        return value
+    return default
 
 
 def get_ephemeral_port():
@@ -52,19 +64,71 @@ class LeafResource(Resource):
         return d
 
 
-class DefaultResource(LeafResource):
+class DefaultResource(Resource):
+    request_count = 0
+
+    def getChild(self, path, request):
+        if path == b"count":
+            return RequestCountResource()
+        return self
+
     def render_POST(self, request):
+        DefaultResource.request_count += 1
         request_data = json.loads(request.content.read())
         request.responseHeaders.setRawHeaders(
             b"Content-Type",
             [b"application/json"],
         )
+        request.responseHeaders.setRawHeaders(
+            b"request-id",
+            [b"abcd1234"],
+        )
 
         response_data: _API_RESPONSE = {}
+
         if "url" not in request_data:
             request.setResponseCode(400)
             return json.dumps(response_data).encode()
         response_data["url"] = request_data["url"]
+
+        domain = urlparse(request_data["url"]).netloc
+        if "bad-key" in domain:
+            request.setResponseCode(401)
+            response_data = {
+                "status": 401,
+                "type": "/auth/key-not-found",
+                "title": "Authentication Key Not Found",
+                "detail": "The authentication key is not valid or can't be matched.",
+            }
+            return json.dumps(response_data).encode()
+        if "forbidden" in domain:
+            request.setResponseCode(451)
+            response_data = {
+                "status": 451,
+                "type": "/download/domain-forbidden",
+                "title": "Domain Forbidden",
+                "detail": "Extraction for the domain is forbidden.",
+                "blockedDomain": domain,
+            }
+            return json.dumps(response_data).encode()
+        if "suspended-account" in domain:
+            request.setResponseCode(403)
+            response_data = {
+                "status": 403,
+                "type": "/auth/account-suspended",
+                "title": "Account Suspended",
+                "detail": "Account is suspended, check billing details.",
+            }
+            return json.dumps(response_data).encode()
+        if "temporary-download-error" in request_data["url"]:
+            request.setResponseCode(520)
+            response_data = {
+                "status": 520,
+                "type": "/download/temporary-error",
+                "title": "...",
+                "detail": "...",
+            }
+            return json.dumps(response_data).encode()
 
         html = "<html><body>Hello<h1>World!</h1></body></html>"
         if "browserHtml" in request_data:
@@ -79,6 +143,29 @@ class DefaultResource(LeafResource):
                     }
                 ).encode()
             response_data["browserHtml"] = html
+        if "screenshot" in request_data:
+            response_data["screenshot"] = b64encode(
+                b"screenshot-body-contents"
+            ).decode()
+
+        if "session" in request_data:
+            # See test_sessions.py::test_param_precedence
+            if domain.startswith("postal-code-10001"):
+                postal_code = None
+                for action in request_data.get("actions", []):
+                    try:
+                        postal_code = action["address"]["postalCode"]
+                    except (KeyError, IndexError, TypeError):
+                        pass
+                    else:
+                        break
+                if postal_code != "10001" and not domain.startswith(
+                    "postal-code-10001-soft"
+                ):
+                    request.setResponseCode(500)
+                    return b""
+            response_data["session"] = request_data["session"]
+
         if "httpResponseBody" in request_data:
             headers = request_data.get("customHttpRequestHeaders", [])
             for header in headers:
@@ -98,7 +185,75 @@ class DefaultResource(LeafResource):
                 {"name": "test_header", "value": "test_value"}
             ]
 
+        actions = request_data.get("actions")
+        if actions:
+            results: List[_ActionResult] = []
+            for action in actions:
+                result: _ActionResult = {
+                    "action": action["action"],
+                    "elapsedTime": 1.0,
+                    "status": "success",
+                }
+                if action["action"] == "setLocation":
+                    if domain.startswith("postal-code-10001"):
+                        try:
+                            postal_code = action["address"]["postalCode"]
+                        except (KeyError, IndexError, TypeError):
+                            postal_code = None
+                        if postal_code != "10001":
+                            result["status"] = "returned"
+                            result["error"] = "Action setLocation failed"
+                    elif domain.startswith("no-location-support"):
+                        result["status"] = "returned"
+                        result["error"] = "Action setLocation not supported on …"
+                results.append(result)
+            response_data["actions"] = results  # type: ignore[assignment]
+
+        if request_data.get("product") is True:
+            response_data["product"] = {
+                "url": response_data["url"],
+                "name": "Product name",
+                "price": "10",
+                "currency": "USD",
+            }
+            assert isinstance(response_data["product"], dict)
+            assert isinstance(response_data["product"]["name"], str)
+            extract_from = request_data.get("productOptions", {}).get("extractFrom")
+            if extract_from:
+                from scrapy_zyte_api.providers import ExtractFrom
+
+                if extract_from == ExtractFrom.httpResponseBody:
+                    response_data["product"]["name"] += " (from httpResponseBody)"
+
+            if "geolocation" in request_data:
+                response_data["product"][
+                    "name"
+                ] += f" (country {request_data['geolocation']})"
+
+            if "customAttributes" in request_data:
+                response_data["customAttributes"] = {
+                    "metadata": {
+                        "textInputTokens": 1000,
+                    },
+                    "values": {
+                        "attr1": "foo",
+                        "attr2": 42,
+                    },
+                }
+
+            if request_data.get("productNavigation") is True:
+                response_data["productNavigation"] = {
+                    "url": response_data["url"],
+                    "name": "Product navigation",
+                    "pageNumber": 0,
+                }
+
         return json.dumps(response_data).encode()
+
+
+class RequestCountResource(LeafResource):
+    def render_GET(self, request):
+        return str(DefaultResource.request_count).encode()
 
 
 class DelayedResource(LeafResource):
@@ -128,9 +283,9 @@ class MockServer:
         resource = resource or DefaultResource
         self.resource = "{}.{}".format(resource.__module__, resource.__name__)
         self.proc = None
-        host = socket.gethostbyname(socket.gethostname())
+        self.host = socket.gethostbyname(socket.gethostname())
         self.port = port or get_ephemeral_port()
-        self.root_url = "http://%s:%d" % (host, self.port)
+        self.root_url = "http://%s:%d" % (self.host, self.port)
 
     def __enter__(self):
         self.proc = Popen(

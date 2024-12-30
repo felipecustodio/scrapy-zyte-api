@@ -1,6 +1,7 @@
 from base64 import b64encode
 from collections import defaultdict
 from functools import partial
+from typing import Any, Dict, cast
 
 import pytest
 from scrapy import Request
@@ -63,7 +64,7 @@ def raw_api_response_browser():
         "echoData": {"some_value": "here"},
         "httpResponseHeaders": [
             {"name": "Content-Type", "value": "text/html"},
-            {"name": "Content-Length", "value": len(PAGE_CONTENT)},
+            {"name": "Content-Length", "value": str(len(PAGE_CONTENT))},
         ],
         "statusCode": 200,
         "experimental": {
@@ -79,7 +80,7 @@ def raw_api_response_body():
         "echoData": {"some_value": "here"},
         "httpResponseHeaders": [
             {"name": "Content-Type", "value": "text/html"},
-            {"name": "Content-Length", "value": len(PAGE_CONTENT)},
+            {"name": "Content-Length", "value": str(len(PAGE_CONTENT))},
         ],
         "statusCode": 200,
         "experimental": {
@@ -96,7 +97,7 @@ def raw_api_response_mixed():
         "echoData": {"some_value": "here"},
         "httpResponseHeaders": [
             {"name": "Content-Type", "value": "text/html"},
-            {"name": "Content-Length", "value": len(PAGE_CONTENT_2)},
+            {"name": "Content-Length", "value": str(len(PAGE_CONTENT_2))},
         ],
         "statusCode": 200,
         "experimental": {
@@ -199,7 +200,7 @@ def test_non_utf8_response():
         "browserHtml": content,
         "httpResponseHeaders": [
             {"name": "Content-Type", "value": "text/html; charset=iso-8859-1"},
-            {"name": "Content-Length", "value": len(content)},
+            {"name": "Content-Length", "value": str(len(content))},
         ],
     }
 
@@ -235,6 +236,7 @@ def test_response_headers_removal(api_response, cls):
     """
     additional_headers = [
         {"name": "Content-Encoding", "value": "gzip"},
+        {"name": "Set-Cookie", "value": "a=b"},
         {"name": "X-Some-Other-Value", "value": "123"},
     ]
     raw_response = api_response()
@@ -242,13 +244,93 @@ def test_response_headers_removal(api_response, cls):
 
     response = cls.from_api_response(raw_response)
 
-    assert response.headers == {
+    expected_headers = {
         b"X-Some-Other-Value": [b"123"],
         **OUTPUT_COOKIE_HEADERS,
     }
+    assert response.headers == expected_headers
     assert (
         response.raw_api_response["httpResponseHeaders"]
         == raw_response["httpResponseHeaders"]
+    )
+
+
+INPUT_COOKIES_SIMPLE = [{"name": "c", "value": "d"}]
+
+
+@pytest.mark.parametrize(
+    "fields,cls,keep",
+    [
+        # Only keep the Set-Cookie header if experimental.responseCookies is
+        # not received.
+        *(
+            (
+                {
+                    **cast(Dict[Any, Any], output_fields),
+                    "httpResponseHeaders": [
+                        {"name": "Content-Type", "value": "text/html"},
+                        {"name": "Content-Length", "value": str(len(PAGE_CONTENT))},
+                    ],
+                    **cookie_fields,  # type: ignore[dict-item]
+                },
+                response_cls,
+                keep,
+            )
+            for output_fields, response_cls in (
+                (
+                    {"httpResponseBody": b64encode(PAGE_CONTENT.encode("utf-8"))},
+                    ZyteAPIResponse,
+                ),
+                (
+                    {
+                        "browserHtml": PAGE_CONTENT,
+                    },
+                    ZyteAPITextResponse,
+                ),
+            )
+            for cookie_fields, keep in (
+                # No response cookies, so Set-Cookie is kept.
+                (
+                    {},
+                    True,
+                ),
+                # Response cookies, so Set-Cookie is not kept.
+                (
+                    {
+                        "experimental": {
+                            "responseCookies": INPUT_COOKIES_SIMPLE,
+                        },
+                    },
+                    False,
+                ),
+            )
+        ),
+    ],
+)
+def test_response_cookie_header(fields, cls, keep):
+    """Test the logic to keep or not the Set-Cookie header in response
+    headers."""
+    expected_headers = {
+        **{
+            header["name"].encode(): [header["value"].encode()]
+            for header in fields["httpResponseHeaders"]
+        },
+    }
+    if keep:
+        expected_headers[b"Set-Cookie"] = [b"a=b"]
+    elif "experimental" in fields:
+        expected_headers[b"Set-Cookie"] = [b"c=d"]
+
+    fields["url"] = "https://example.com"
+    fields["statusCode"] = 200
+    fields["httpResponseHeaders"].append({"name": "Set-Cookie", "value": "a=b"})
+
+    response = cls.from_api_response(fields)
+
+    assert response.headers == expected_headers
+    assert (
+        response.raw_api_response["httpResponseHeaders"]
+        == fields["httpResponseHeaders"]
     )
 
 
@@ -261,7 +343,7 @@ def test__process_response_no_body():
         "product": {"name": "shoes"},
     }
 
-    resp = _process_response(api_response, Request(api_response["url"]))
+    resp = _process_response(api_response, Request(cast(str, api_response["url"])))
 
     assert isinstance(resp, Response)
     assert resp.body == b""
@@ -359,8 +441,7 @@ def test__process_response_body_and_headers(encoding, content_type):
             "utf-16-le",
         ),
         (
-            """<html><head><meta http-equiv="Content-Type" content="text/html; charset="gb2312">
-            </head><body>✨</body></html>""",
+            """<html><head><meta http-equiv="Content-Type" content="text/html; charset="gb2312"></head><body>✨</body></html>""",
             "✨",
             "gb18030",
             None,
@@ -431,7 +512,7 @@ def test__process_response_non_text():
             }
         ],
     }
-    resp = _process_response(api_response, Request(api_response["url"]))
+    resp = _process_response(api_response, Request(cast(str, api_response["url"])))
 
     assert isinstance(resp, Response)
     with pytest.raises(NotSupported):
